@@ -11,12 +11,35 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 /// Convert a command result into `T`, treating `null` as `T::default()`.
-fn result_as<T: DeserializeOwned + Default>(v: Value) -> Result<T> {
+pub(crate) fn result_as<T: DeserializeOwned + Default>(v: Value) -> Result<T> {
     if v.is_null() {
         Ok(T::default())
     } else {
         Ok(serde_json::from_value(v)?)
     }
+}
+
+/// Convert the result of `Code` into messages (null, a message list or a single message).
+pub(crate) fn code_result(v: Value) -> Result<Option<Vec<Message>>> {
+    match v {
+        Value::Null => Ok(None),
+        v @ Value::Array(_) => Ok(Some(serde_json::from_value(v)?)),
+        v => Ok(Some(vec![serde_json::from_value(v)?])),
+    }
+}
+
+/// Extract the session id from the result of `AddUserSession`.
+pub(crate) fn session_id(res: &Value) -> Result<i64> {
+    res.as_i64()
+        .or_else(|| res.as_str().and_then(|s| s.parse().ok()))
+        .ok_or_else(|| Error::InvalidArgument("server did not return a session id".into()))
+}
+
+/// Extract the socket path from the result of `AddHttpEndpoint`.
+pub(crate) fn endpoint_socket_path(res: &Value) -> Result<&str> {
+    res.as_str().ok_or_else(|| {
+        Error::InvalidArgument("server did not return an endpoint socket path".into())
+    })
 }
 
 /// The command API shared by command and intercept connections.
@@ -46,9 +69,7 @@ pub trait CommandApi {
             path: path.into(),
             is_upload_request,
         })?;
-        let socket_file = res.as_str().ok_or_else(|| {
-            Error::InvalidArgument("server did not return an endpoint socket path".into())
-        })?;
+        let socket_file = endpoint_socket_path(&res)?;
         let debug = self.connection_mut().debug();
         HttpEndpointUnixSocket::new(endpoint_type, namespace, path, socket_file, backlog, debug)
     }
@@ -78,9 +99,7 @@ pub trait CommandApi {
             session_type,
             origin,
         })?;
-        res.as_i64()
-            .or_else(|| res.as_str().and_then(|s| s.parse().ok()))
-            .ok_or_else(|| Error::InvalidArgument("server did not return a session id".into()))
+        session_id(&res)
     }
 
     /// Check a password (see M551).
@@ -174,11 +193,7 @@ pub trait CommandApi {
 
     /// Execute a pre-parsed code and return its resulting messages.
     fn perform_code(&mut self, code: &Code) -> Result<Option<Vec<Message>>> {
-        match self.perform_command(&Command::Code(code.clone()))? {
-            Value::Null => Ok(None),
-            v @ Value::Array(_) => Ok(Some(serde_json::from_value(v)?)),
-            v => Ok(Some(vec![serde_json::from_value(v)?])),
-        }
+        code_result(self.perform_command(&Command::Code(code.clone()))?)
     }
 
     /// Execute a G/M/T-code given as text and return its reply.

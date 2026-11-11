@@ -1,7 +1,10 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 //! Synchronous client for the Duet3D DuetSoftwareFramework (DSF) UNIX socket API.
 //!
 //! The object model is not typed: it is a plain [`serde_json::Value`]. Use
 //! [`object_model::apply_patch`] to apply patches received in patch subscription mode.
+//!
+//! With the optional `tokio` cargo feature, an async API is available in the `asynchronous` module.
 //!
 //! ```no_run
 //! use dsf::{CodeChannel, CommandApi, CommandConnection};
@@ -14,6 +17,9 @@
 //! # Ok(()) }
 //! ```
 
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+pub mod asynchronous;
 pub mod code;
 pub mod code_parameter;
 pub mod commands;

@@ -348,3 +348,180 @@ fn intercept_command_api_flush() {
     assert!(c.flush(CodeChannel::File).unwrap());
     m.handle.join().unwrap();
 }
+
+// ---- perform_simple_code_cb ----
+
+use std::sync::mpsc;
+
+fn recv<T>(rx: &mpsc::Receiver<T>) -> T {
+    rx.recv_timeout(Duration::from_secs(5)).unwrap()
+}
+
+#[test]
+fn cb_returns_before_reply_and_delivers_result() {
+    let m = mock_n(2, |i, mut s| {
+        handshake(&mut s);
+        if i == 0 {
+            drain(&mut s);
+            return;
+        }
+        assert_eq!(
+            read_json(&mut s),
+            json!({"command":"SimpleCode","code":"G28","channel":"SBC","executeAsynchronously":false})
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        send(&mut s, r#"{"success":true,"result":"homed"}"#);
+        drain(&mut s);
+    });
+    let mut c = CommandConnection::new();
+    c.connect(&m.path).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let t = Instant::now();
+    c.perform_simple_code_cb("G28", CodeChannel::Sbc, move |r| tx.send(r).unwrap())
+        .unwrap();
+    assert!(t.elapsed() < Duration::from_millis(50));
+    assert_eq!(recv(&rx).unwrap(), "homed");
+    assert!(t.elapsed() >= Duration::from_millis(190));
+    c.close();
+    m.handle.join().unwrap();
+}
+
+#[test]
+fn cb_error_response() {
+    let m = mock_n(2, |i, mut s| {
+        handshake(&mut s);
+        if i == 1 {
+            read_json(&mut s);
+            send(
+                &mut s,
+                r#"{"success":false,"errorType":"E","errorMessage":"bad"}"#,
+            );
+        }
+        drain(&mut s);
+    });
+    let mut c = CommandConnection::new();
+    c.connect(&m.path).unwrap();
+    let (tx, rx) = mpsc::channel();
+    c.perform_simple_code_cb("G1", CodeChannel::Sbc, move |r| tx.send(r).unwrap())
+        .unwrap();
+    match recv(&rx) {
+        Err(Error::InternalServer {
+            command,
+            error_type,
+            ..
+        }) => {
+            assert_eq!(command, "SimpleCode");
+            assert_eq!(error_type, "E");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    c.close();
+    m.handle.join().unwrap();
+}
+
+#[test]
+fn cb_runs_in_order_on_one_worker_connection() {
+    let m = mock_n(2, |i, mut s| {
+        handshake(&mut s);
+        if i == 1 {
+            assert_eq!(read_json(&mut s)["code"], "G28");
+            send(&mut s, r#"{"success":true,"result":"one"}"#);
+            assert_eq!(read_json(&mut s)["code"], "M115");
+            send(&mut s, r#"{"success":true,"result":"two"}"#);
+        }
+        drain(&mut s);
+    });
+    let mut c = CommandConnection::new();
+    c.connect(&m.path).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let tx2 = tx.clone();
+    c.perform_simple_code_cb("G28", CodeChannel::Sbc, move |r| {
+        tx.send(r.unwrap()).unwrap()
+    })
+    .unwrap();
+    c.perform_simple_code_cb("M115", CodeChannel::Sbc, move |r| {
+        tx2.send(r.unwrap()).unwrap()
+    })
+    .unwrap();
+    assert_eq!(recv(&rx), "one");
+    assert_eq!(recv(&rx), "two");
+    c.close();
+    m.handle.join().unwrap();
+}
+
+#[test]
+fn cb_not_connected() {
+    let mut c = CommandConnection::new();
+    let r = c.perform_simple_code_cb("G28", CodeChannel::Sbc, |_| panic!("must not run"));
+    assert!(matches!(r, Err(Error::NotConnected)));
+}
+
+#[test]
+fn wait_pending_joins_and_worker_restarts() {
+    let m = mock_n(3, |i, mut s| {
+        handshake(&mut s);
+        if i > 0 {
+            read_json(&mut s);
+            std::thread::sleep(Duration::from_millis(100));
+            send(&mut s, r#"{"success":true,"result":"r"}"#);
+        }
+        drain(&mut s);
+    });
+    let mut c = CommandConnection::new();
+    c.connect(&m.path).unwrap();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for expected in 1..=2 {
+        let d = done.clone();
+        c.perform_simple_code_cb("G28", CodeChannel::Sbc, move |r| {
+            r.unwrap();
+            d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap();
+        c.wait_pending();
+        assert_eq!(done.load(std::sync::atomic::Ordering::SeqCst), expected);
+    }
+    c.close();
+    m.handle.join().unwrap();
+}
+
+#[test]
+fn cb_panic_does_not_stop_worker() {
+    let m = mock_n(2, |i, mut s| {
+        handshake(&mut s);
+        if i == 1 {
+            for _ in 0..2 {
+                read_json(&mut s);
+                send(&mut s, r#"{"success":true,"result":"ok"}"#);
+            }
+        }
+        drain(&mut s);
+    });
+    let mut c = CommandConnection::new();
+    c.connect(&m.path).unwrap();
+    let (tx, rx) = mpsc::channel();
+    c.perform_simple_code_cb("G1", CodeChannel::Sbc, |_| panic!("boom"))
+        .unwrap();
+    c.perform_simple_code_cb("G2", CodeChannel::Sbc, move |r| tx.send(r).unwrap())
+        .unwrap();
+    assert_eq!(recv(&rx).unwrap(), "ok");
+    c.close();
+    m.handle.join().unwrap();
+}
+
+#[test]
+fn cb_worker_connect_failure_goes_to_callback() {
+    let m = mock_n(1, |_, mut s| {
+        handshake(&mut s);
+        drain(&mut s);
+    });
+    let mut c = CommandConnection::new();
+    c.connect(&m.path).unwrap();
+    // The server only accepts one connection; remove the socket so the worker cannot connect.
+    std::fs::remove_file(&m.path).unwrap();
+    let (tx, rx) = mpsc::channel();
+    c.perform_simple_code_cb("G1", CodeChannel::Sbc, move |r| tx.send(r).unwrap())
+        .unwrap();
+    assert!(matches!(recv(&rx), Err(Error::Io(_))));
+    c.close();
+    m.handle.join().unwrap();
+}

@@ -7,15 +7,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 #[derive(Deserialize)]
-struct ServerInit {
-    version: u32,
+pub(crate) struct ServerInit {
+    pub(crate) version: u32,
     #[serde(default)]
-    id: i64,
+    pub(crate) id: i64,
+}
+
+impl ServerInit {
+    /// Check that the server speaks a protocol version at least as new as ours.
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.version < PROTOCOL_VERSION {
+            return Err(Error::IncompatibleVersion {
+                need: PROTOCOL_VERSION,
+                got: self.version,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A response to a command, as sent by the server.
@@ -35,10 +48,45 @@ pub struct Response {
     pub error_message: Option<String>,
 }
 
+impl Response {
+    /// Interpret the response to the init message.
+    pub(crate) fn into_init_result(self) -> Result<()> {
+        if self.success {
+            return Ok(());
+        }
+        Err(Error::ConnectionRejected {
+            error_type: self.error_type.unwrap_or_default(),
+            error_message: self.error_message.unwrap_or_default(),
+        })
+    }
+
+    /// Interpret the response to `command`, mapping server errors to [`Error`]s.
+    pub(crate) fn into_command_result(self, command: &Command) -> Result<Value> {
+        if self.success {
+            return Ok(self.result);
+        }
+        let error_type = self.error_type.unwrap_or_default();
+        let error_message = self.error_message.unwrap_or_default();
+        if error_type == "TaskCanceledException" {
+            return Err(Error::TaskCanceled(error_message));
+        }
+        let name = serde_json::to_value(command)
+            .ok()
+            .and_then(|v| v.get("command").and_then(|c| c.as_str().map(String::from)))
+            .unwrap_or_default();
+        Err(Error::InternalServer {
+            command: name,
+            error_type,
+            error_message,
+        })
+    }
+}
+
 /// Low-level connection shared by all connection types.
 #[derive(Debug)]
 pub struct BaseConnection {
     stream: Option<UnixStream>,
+    socket_path: Option<PathBuf>,
     id: i64,
     buf: Vec<u8>,
     timeout: Option<Duration>,
@@ -50,6 +98,7 @@ impl BaseConnection {
     pub fn new(timeout: Option<Duration>, debug: bool) -> Self {
         BaseConnection {
             stream: None,
+            socket_path: None,
             id: 0,
             buf: Vec::new(),
             timeout,
@@ -60,6 +109,11 @@ impl BaseConnection {
     /// Connection id assigned by the server.
     pub fn id(&self) -> i64 {
         self.id
+    }
+
+    /// Path of the socket this connection was last connected to, if any.
+    pub fn socket_path(&self) -> Option<&Path> {
+        self.socket_path.as_deref()
     }
 
     /// Whether a socket is currently open.
@@ -90,6 +144,7 @@ impl BaseConnection {
     /// Connect to the socket, perform the version handshake and select the connection mode.
     pub fn connect(&mut self, init: &InitMessage, socket_file: impl AsRef<Path>) -> Result<()> {
         self.close();
+        self.socket_path = Some(socket_file.as_ref().to_path_buf());
         let stream = UnixStream::connect(socket_file)?;
         self.stream = Some(stream);
         self.buf.clear();
@@ -102,21 +157,11 @@ impl BaseConnection {
 
     fn handshake(&mut self, init: &InitMessage) -> Result<()> {
         let hello: ServerInit = self.receive()?;
-        if hello.version < PROTOCOL_VERSION {
-            return Err(Error::IncompatibleVersion {
-                need: PROTOCOL_VERSION,
-                got: hello.version,
-            });
-        }
+        hello.check()?;
         self.id = hello.id;
         self.send(init)?;
         let response = self.receive_response()?;
-        if !response.success {
-            return Err(Error::ConnectionRejected {
-                error_type: response.error_type.unwrap_or_default(),
-                error_message: response.error_message.unwrap_or_default(),
-            });
-        }
+        response.into_init_result()?;
         Ok(())
     }
 
@@ -168,22 +213,6 @@ impl BaseConnection {
     pub fn perform_command(&mut self, command: &Command) -> Result<Value> {
         self.send(command)?;
         let response = self.receive_response()?;
-        if response.success {
-            return Ok(response.result);
-        }
-        let error_type = response.error_type.unwrap_or_default();
-        let error_message = response.error_message.unwrap_or_default();
-        if error_type == "TaskCanceledException" {
-            return Err(Error::TaskCanceled(error_message));
-        }
-        let name = serde_json::to_value(command)
-            .ok()
-            .and_then(|v| v.get("command").and_then(|c| c.as_str().map(String::from)))
-            .unwrap_or_default();
-        Err(Error::InternalServer {
-            command: name,
-            error_type,
-            error_message,
-        })
+        response.into_command_result(command)
     }
 }

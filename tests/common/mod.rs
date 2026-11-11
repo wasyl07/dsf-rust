@@ -57,3 +57,32 @@ pub fn handshake(s: &mut UnixStream) -> Value {
     send(s, r#"{"success":true}"#);
     init
 }
+
+/// Start a mock server accepting exactly `n` connections; `f(index, stream)` runs on a thread each.
+pub fn mock_n<F>(n: usize, f: F) -> Mock
+where
+    F: Fn(usize, UnixStream) + Send + Sync + 'static,
+{
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dcs.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let f = std::sync::Arc::new(f);
+    let handle = std::thread::spawn(move || {
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let (s, _) = listener.accept().unwrap();
+            let f = f.clone();
+            handles.push(std::thread::spawn(move || f(i, s)));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+    Mock { dir, path, handle }
+}
+
+/// Block until the client closes the stream.
+pub fn drain(s: &mut UnixStream) {
+    let mut b = [0u8; 256];
+    while s.read(&mut b).map(|n| n > 0).unwrap_or(false) {}
+}

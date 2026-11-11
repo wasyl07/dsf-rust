@@ -4,17 +4,23 @@ mod api;
 mod base;
 
 pub use api::CommandApi;
+#[cfg(feature = "tokio")]
+pub(crate) use api::{code_result, endpoint_socket_path, result_as, session_id};
+#[cfg(feature = "tokio")]
+pub(crate) use base::ServerInit;
 pub use base::{BaseConnection, Response};
 
 use crate::code::Code;
 use crate::commands::{Command, InitMessage};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{CodeChannel, InterceptionMode, MessageType, SubscriptionMode};
 use crate::{default_socket_file, PROTOCOL_VERSION};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// Default receive timeout of command connections.
@@ -24,6 +30,66 @@ pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug)]
 pub struct CommandConnection {
     base: BaseConnection,
+    worker: Option<Worker>,
+}
+
+type SimpleCodeCallback = Box<dyn FnOnce(Result<String>) + Send + 'static>;
+
+struct Job {
+    code: String,
+    channel: CodeChannel,
+    callback: SimpleCodeCallback,
+}
+
+struct Worker {
+    tx: mpsc::Sender<Job>,
+    handle: JoinHandle<()>,
+}
+
+impl std::fmt::Debug for Worker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Worker")
+    }
+}
+
+fn run_callback(callback: SimpleCodeCallback, result: Result<String>) {
+    // A panicking user callback must not kill the worker.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || callback(result)));
+}
+
+fn worker_loop(socket_path: PathBuf, debug: bool, rx: mpsc::Receiver<Job>) {
+    let mut conn: Option<CommandConnection> = None;
+    // Ends once the sender is dropped and all queued jobs have been run.
+    for job in rx {
+        if conn.is_none() {
+            let mut c = CommandConnection::new()
+                .with_timeout(None)
+                .with_debug(debug);
+            match c.connect(&socket_path) {
+                Ok(()) => conn = Some(c),
+                Err(e) => {
+                    run_callback(job.callback, Err(e));
+                    continue;
+                }
+            }
+        }
+        let result = match conn.as_mut() {
+            Some(c) => c.perform_simple_code(&job.code, job.channel, false),
+            None => Err(Error::NotConnected),
+        };
+        // After a transport-level failure the connection is unusable: reconnect on the next job.
+        if matches!(
+            result,
+            Err(Error::Io(_)
+                | Error::Json(_)
+                | Error::Timeout
+                | Error::ConnectionClosed
+                | Error::NotConnected)
+        ) {
+            conn = None;
+        }
+        run_callback(job.callback, result);
+    }
 }
 
 impl Default for CommandConnection {
@@ -37,6 +103,7 @@ impl CommandConnection {
     pub fn new() -> Self {
         CommandConnection {
             base: BaseConnection::new(Some(DEFAULT_COMMAND_TIMEOUT), false),
+            worker: None,
         }
     }
 
@@ -68,19 +135,99 @@ impl CommandConnection {
     }
 
     /// Close the connection.
+    ///
+    /// Pending [`perform_simple_code_cb`](Self::perform_simple_code_cb) jobs still run to
+    /// completion on the background worker, which is not joined (see
+    /// [`wait_pending`](Self::wait_pending)).
     pub fn close(&mut self) {
         self.base.close();
+        self.worker = None;
     }
 
     /// Access the underlying base connection.
     pub fn base(&self) -> &BaseConnection {
         &self.base
     }
+
+    /// Execute a code without blocking; `callback` receives the reply or the error.
+    ///
+    /// Returns immediately (with [`Error::NotConnected`] if this connection is not connected).
+    /// The code runs on a background worker thread that owns a separate connection to the same
+    /// socket (receive timeout: none, so long codes such as `G28` do not time out; debug output
+    /// is inherited). The worker is started on first use. The callback runs on that thread, so
+    /// it must not block for long. A panic in a callback is caught and does not stop the worker.
+    ///
+    /// Jobs run in submission order, but ordering is guaranteed only among `_cb` calls: blocking
+    /// calls on this connection go over a different DSF connection and may overtake them. If the
+    /// worker's connection cannot be opened or breaks, the affected callbacks get the error and
+    /// the worker reconnects for the next job.
+    ///
+    /// Dropping or closing this connection lets already queued jobs finish without joining the
+    /// worker; use [`wait_pending`](Self::wait_pending) to wait for them.
+    ///
+    /// With the `tokio` feature, async users can simply `tokio::spawn` a call on an
+    /// `AsyncCommandConnection` instead.
+    pub fn perform_simple_code_cb<F>(
+        &mut self,
+        code: &str,
+        channel: CodeChannel,
+        callback: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(Result<String>) + Send + 'static,
+    {
+        if !self.base.is_connected() {
+            return Err(Error::NotConnected);
+        }
+        let path = self
+            .base
+            .socket_path()
+            .ok_or(Error::NotConnected)?
+            .to_path_buf();
+        if self.worker.is_none() {
+            let (tx, rx) = mpsc::channel();
+            let debug = self.base.debug();
+            let handle = std::thread::spawn(move || worker_loop(path, debug, rx));
+            self.worker = Some(Worker { tx, handle });
+        }
+        let job = Job {
+            code: code.to_string(),
+            channel,
+            callback: Box::new(callback),
+        };
+        match self.worker.as_ref().map(|w| w.tx.send(job)) {
+            Some(Ok(())) => Ok(()),
+            _ => Err(Error::ConnectionClosed),
+        }
+    }
+
+    /// Wait until all jobs submitted with
+    /// [`perform_simple_code_cb`](Self::perform_simple_code_cb) have finished and their
+    /// callbacks have run. A later `_cb` call starts a fresh worker.
+    pub fn wait_pending(&mut self) {
+        if let Some(Worker { tx, handle }) = self.worker.take() {
+            drop(tx);
+            let _ = handle.join();
+        }
+    }
 }
 
 impl CommandApi for CommandConnection {
     fn connection_mut(&mut self) -> &mut BaseConnection {
         &mut self.base
+    }
+}
+
+pub(crate) fn subscribe_init(
+    mode: SubscriptionMode,
+    filter: &str,
+    filters: &Option<Vec<String>>,
+) -> InitMessage {
+    InitMessage::Subscribe {
+        version: PROTOCOL_VERSION,
+        subscription_mode: mode,
+        filter: filter.to_string(),
+        filters: filters.clone(),
     }
 }
 
@@ -127,12 +274,7 @@ impl SubscribeConnection {
 
     /// Connect to the given UNIX socket.
     pub fn connect(&mut self, socket_file: impl AsRef<Path>) -> Result<()> {
-        let init = InitMessage::Subscribe {
-            version: PROTOCOL_VERSION,
-            subscription_mode: self.mode,
-            filter: self.filter.clone(),
-            filters: self.filters.clone(),
-        };
+        let init = subscribe_init(self.mode, &self.filter, &self.filters);
         self.base.connect(&init, socket_file)
     }
 
@@ -196,6 +338,18 @@ pub struct InterceptOptions {
 }
 
 impl InterceptOptions {
+    pub(crate) fn init_message(&self) -> InitMessage {
+        InitMessage::Intercept {
+            version: PROTOCOL_VERSION,
+            interception_mode: self.mode,
+            channels: self.channels.clone(),
+            filters: self.filters.clone(),
+            priority_codes: self.priority_codes,
+            auto_flush: self.auto_flush,
+            auto_evaluate_expressions: self.auto_evaluate_expression,
+        }
+    }
+
     /// Default options for the given mode.
     pub fn new(mode: InterceptionMode) -> Self {
         InterceptOptions {
@@ -224,7 +378,7 @@ pub struct InterceptConnection {
 pub struct InterceptCanceller(Arc<AtomicBool>);
 
 impl InterceptCanceller {
-    /// Make the current or next `receive_code` call return [`Error::Cancelled`](crate::Error::Cancelled).
+    /// Make the current or next `receive_code` call return [`Error::Cancelled`].
     ///
     /// The request is one-shot: the call that returns `Cancelled` resets it.
     pub fn cancel(&self) {
@@ -249,16 +403,7 @@ impl InterceptConnection {
 
     /// Connect to the given UNIX socket.
     pub fn connect(&mut self, socket_file: impl AsRef<Path>) -> Result<()> {
-        let o = &self.options;
-        let init = InitMessage::Intercept {
-            version: PROTOCOL_VERSION,
-            interception_mode: o.mode,
-            channels: o.channels.clone(),
-            filters: o.filters.clone(),
-            priority_codes: o.priority_codes,
-            auto_flush: o.auto_flush,
-            auto_evaluate_expressions: o.auto_evaluate_expression,
-        };
+        let init = self.options.init_message();
         self.base.connect(&init, socket_file)
     }
 
@@ -279,7 +424,7 @@ impl InterceptConnection {
 
     /// Wait for a code to be intercepted and read it.
     ///
-    /// Returns [`Error::Cancelled`](crate::Error::Cancelled) if an [`InterceptCanceller`] fires
+    /// Returns [`Error::Cancelled`] if an [`InterceptCanceller`] fires
     /// while waiting, or fired before this call. A complete code that is already buffered is
     /// returned before the cancel flag is checked. The connection stays usable after a
     /// cancellation and partially received data is kept. The overall timeout still applies.

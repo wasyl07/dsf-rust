@@ -8,11 +8,34 @@ readme = "README.md"
 keywords = ["duet3d", "dsf", "reprap", "3d-printing"]
 categories = ["api-bindings"]
 
+[features]
+default = []
+# Async (tokio) API in `dsf::asynchronous`
+tokio = ["dep:tokio"]
+
+[package.metadata.docs.rs]
+features = ["tokio"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1"
 thiserror = "2"
+tokio = { version = "1", optional = true, default-features = false, features = ["net", "io-util", "time", "rt"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "signal", "sync"] }
+
+[[example]]
+name = "async_send_simple_code"
+required-features = ["tokio"]
+
+[[example]]
+name = "async_custom_m_codes"
+required-features = ["tokio"]
+
+[[example]]
+name = "async_subscribe_object_model"
+required-features = ["tokio"]

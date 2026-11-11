@@ -53,10 +53,27 @@ pub struct ReceivedHttpRequest {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct HttpResponse<'a> {
-    status_code: u16,
-    response: &'a str,
-    response_type: HttpResponseType,
+pub(crate) struct HttpResponse<'a> {
+    pub(crate) status_code: u16,
+    pub(crate) response: &'a str,
+    pub(crate) response_type: HttpResponseType,
+}
+
+/// Remove the stale socket file (if any).
+pub(crate) fn prepare_socket_path(socket_file: &Path) -> Result<()> {
+    match std::fs::remove_file(socket_file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Add group read/write permissions to the socket file.
+pub(crate) fn chmod_socket(socket_file: &Path) -> Result<()> {
+    let mut perms = std::fs::metadata(socket_file)?.permissions();
+    perms.set_mode(perms.mode() | 0o060);
+    std::fs::set_permissions(socket_file, perms)?;
+    Ok(())
 }
 
 /// A single connection of a custom HTTP endpoint.
@@ -173,15 +190,9 @@ impl HttpEndpointUnixSocket {
     ) -> Result<Self> {
         let _ = backlog;
         let socket_file = socket_file.as_ref().to_path_buf();
-        match std::fs::remove_file(&socket_file) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+        prepare_socket_path(&socket_file)?;
         let listener = UnixListener::bind(&socket_file)?;
-        let mut perms = std::fs::metadata(&socket_file)?.permissions();
-        perms.set_mode(perms.mode() | 0o060);
-        std::fs::set_permissions(&socket_file, perms)?;
+        chmod_socket(&socket_file)?;
 
         let handler: Arc<Mutex<Option<Handler>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
